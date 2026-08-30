@@ -8,7 +8,7 @@ import {
   type JobMatch,
 } from "@/lib/job-match";
 
-const GOOGLE_CLIENT_ID = "PASTE_GOOGLE_CLIENT_ID_HERE";
+const GOOGLE_CLIENT_ID = "1000693491801-93th0r0hrdsd7iol5an9jl1ks46s5gp1.apps.googleusercontent.com";
 const GMAIL_READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly";
 const JOB_QUERY = [
   "newer_than:30d",

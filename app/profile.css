@@ -1,0 +1,46 @@
+.profileIdentity {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  margin: -4px 0 16px;
+  padding: 12px 13px;
+  border: 1px solid var(--line);
+  border-radius: 13px;
+  background: #f8f9fc;
+}
+
+.profileIdentity > div {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.profileIdentity strong {
+  font-size: 13px;
+}
+
+.profileIdentity span {
+  color: var(--muted);
+  font-size: 10px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.resetLink {
+  flex: 0 0 auto;
+  border: 0;
+  background: transparent;
+  color: var(--accent);
+  font-weight: 750;
+  font-size: 11px;
+  cursor: pointer;
+  padding: 5px 3px;
+}
+
+.reasonRow span.caution {
+  background: #fff1ef;
+  color: #a33a31;
+}

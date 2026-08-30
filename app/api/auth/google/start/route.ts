@@ -4,6 +4,8 @@ import { cookies } from "next/headers";
 import { buildGoogleAuthUrl } from "@/lib/google";
 
 export async function GET(request: Request) {
+  const url = new URL(request.url);
+
   try {
     const state = crypto.randomBytes(24).toString("hex");
     const store = await cookies();
@@ -18,6 +20,7 @@ export async function GET(request: Request) {
     return NextResponse.redirect(buildGoogleAuthUrl(request, state));
   } catch (error) {
     const message = error instanceof Error ? error.message : "Could not start Google sign-in.";
-    return NextResponse.json({ error: message }, { status: 500 });
+    const reason = message.includes("credentials are not configured") ? "config" : "error";
+    return NextResponse.redirect(`${url.origin}/?gmail=${reason}`);
   }
 }

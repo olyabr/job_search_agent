@@ -4,12 +4,13 @@ A privacy-conscious Next.js app that reads **job-related Gmail messages with rea
 
 ## MVP features
 
-- Google OAuth connection to Gmail
+- Gmail connection using Google Identity Services in the browser
 - Gmail scope is `gmail.readonly` only
+- No Google client secret is stored by the app
+- No Vercel environment variables are required for Gmail authorization
 - Google email address acts as the user identity
 - Separate career profile for each connected Gmail account on a device
-- OAuth state validation
-- Encrypted HTTP-only session cookie for Google tokens
+- Google access token is short-lived and kept in browser `sessionStorage`
 - Scans up to 50 recent job-related emails from the last 30 days
 - Recognizes common alerts from Indeed, LinkedIn, Rigzone, ZipRecruiter, Glassdoor, and generic job emails
 - Transparent 0–100 matching based on role, skills, seniority, preferred location/remote fit, and industry keywords
@@ -23,11 +24,11 @@ A privacy-conscious Next.js app that reads **job-related Gmail messages with rea
 The same deployed website can be used by multiple people.
 
 1. Each person connects their own Google/Gmail account.
-2. Their Gmail OAuth session is held in an encrypted HTTP-only cookie in their browser.
+2. Google issues a short-lived Gmail read-only access token directly to that browser session.
 3. Their career profile is stored under a key derived from their connected Gmail address in that browser's `localStorage`.
 4. Switching Gmail accounts loads a different profile instead of reusing the previous person's settings.
 
-This gives the MVP safe account separation for normal use on separate devices and browser sessions. It does **not** yet provide cross-device profile sync or unattended background scans. Those require server-side encrypted persistence and are the next infrastructure milestone.
+This provides simple account separation without storing Gmail refresh tokens or client secrets on the server. It does **not** yet provide cross-device profile sync or unattended background scans.
 
 ## Career profile settings
 
@@ -43,9 +44,34 @@ Each user can customize:
 - whether remote roles are preferred
 - minimum match threshold
 
-## Run locally
+## Google OAuth setup
 
-### 1. Install
+Only a **Google Web OAuth Client ID** is needed. Client IDs are public identifiers; no client secret is used by this MVP.
+
+In Google Cloud Console:
+
+1. Create or select a Google Cloud project.
+2. Enable the **Gmail API**.
+3. Configure the OAuth consent screen.
+4. Create an **OAuth 2.0 Client ID** for a **Web application**.
+5. Add the deployed site as an **Authorized JavaScript origin**:
+
+```text
+https://job-search-agent-olive.vercel.app
+```
+
+For local development also add:
+
+```text
+http://localhost:3000
+```
+
+6. If the OAuth application is in testing mode, add every Gmail account that should use the app as an OAuth test user.
+7. Copy the generated Client ID and replace `PASTE_GOOGLE_CLIENT_ID_HERE` in `app/page.tsx`.
+
+No redirect URI is required for this popup token flow.
+
+## Run locally
 
 ```bash
 npm install
@@ -54,54 +80,18 @@ npm run dev
 
 Open `http://localhost:3000`.
 
-### 2. Configure Google OAuth
-
-In Google Cloud Console:
-
-1. Create or select a Google Cloud project.
-2. Enable the **Gmail API**.
-3. Configure the OAuth consent screen.
-4. Create an **OAuth 2.0 Client ID** for a Web application.
-5. Add this authorized redirect URI for local development:
-
-```text
-http://localhost:3000/api/auth/google/callback
-```
-
-If the OAuth application is still in testing mode, add every Gmail account that should test the app as an OAuth test user.
-
-### 3. Environment variables
-
-Copy `.env.example` to `.env.local` and fill in:
-
-```bash
-GOOGLE_CLIENT_ID=...
-GOOGLE_CLIENT_SECRET=...
-SESSION_SECRET=use-a-long-random-secret-at-least-32-characters
-```
-
-`GOOGLE_REDIRECT_URI` is optional locally. If omitted, the callback URL is generated from the incoming request origin.
-
 ## Deploy to Vercel
 
-1. Import `olyabr/job_search_agent` into Vercel.
-2. Add `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, and `SESSION_SECRET` as encrypted environment variables.
-3. Add the production callback URL to the Google OAuth client, for example:
-
-```text
-https://your-app.vercel.app/api/auth/google/callback
-```
-
-4. Redeploy after adding environment variables.
+Deploy the repository normally. Gmail authorization does not require `GOOGLE_CLIENT_SECRET`, `SESSION_SECRET`, or any other Vercel environment variable in this browser-token MVP.
 
 ## Security model
 
 - The app never asks for or stores a Gmail password.
 - Gmail permission is read-only; the app cannot send, delete, archive, label, or edit mail.
-- Google OAuth access/refresh tokens are encrypted with AES-256-GCM before being placed in an HTTP-only cookie.
+- The Google access token is short-lived and kept in browser `sessionStorage`, not persisted in the repository or Vercel configuration.
 - Career-profile fields stay in the user's browser in this MVP.
 - Gmail is scanned only when the user presses **Scan job emails**.
-- Disconnect attempts to revoke the Google token and always clears the local OAuth session.
+- Disconnect revokes the current Google access token when possible and clears the browser session.
 
 ## Matching logic
 
@@ -118,8 +108,8 @@ A later version can add an LLM-based job-description/resume evaluator while keep
 
 ## Next milestones
 
-1. Add encrypted database persistence for account profiles and OAuth tokens.
-2. Add scheduled daily scans and notifications.
+1. Add encrypted database persistence for account profiles if cross-device sync is needed.
+2. Add scheduled daily scans using a server-side OAuth flow only if unattended processing becomes necessary.
 3. Follow application links and ingest full job descriptions where permitted.
 4. Add resume upload and AI-based fit analysis.
 5. Add Apply / Consider / Skip workflow and application tracking.

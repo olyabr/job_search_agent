@@ -1,8 +1,11 @@
 export type CareerProfile = {
+  profileName: string;
   targetRoles: string;
   skills: string;
   preferredLocations: string;
   industryKeywords: string;
+  seniorityKeywords: string;
+  avoidKeywords: string;
   remoteOkay: boolean;
   minimumMatch: number;
 };
@@ -28,7 +31,7 @@ export type JobMatch = {
   emailUrl: string;
 };
 
-function splitTerms(value: string) {
+function splitTerms(value = "") {
   return value
     .split(/[\n,;]+/)
     .map((term) => term.trim())
@@ -92,7 +95,7 @@ function titleScore(title: string, targetRoles: string[]) {
     const roleNorm = normalize(role);
     if (!roleNorm) continue;
     if (titleNorm.includes(roleNorm) || roleNorm.includes(titleNorm)) {
-      best = Math.max(best, 38);
+      best = Math.max(best, 40);
       continue;
     }
 
@@ -100,7 +103,7 @@ function titleScore(title: string, targetRoles: string[]) {
     const titleTokens = new Set(titleNorm.split(" ").filter((token) => token.length > 2));
     if (!roleTokens.size) continue;
     const overlap = [...roleTokens].filter((token) => titleTokens.has(token)).length / roleTokens.size;
-    best = Math.max(best, Math.round(overlap * 32));
+    best = Math.max(best, Math.round(overlap * 34));
   }
 
   return best;
@@ -111,6 +114,8 @@ export function rankJobs(emails: EmailJobInput[], profile: CareerProfile) {
   const skills = splitTerms(profile.skills);
   const locations = splitTerms(profile.preferredLocations);
   const industries = splitTerms(profile.industryKeywords);
+  const seniority = splitTerms(profile.seniorityKeywords);
+  const avoid = splitTerms(profile.avoidKeywords);
 
   const jobs = emails.map((email): JobMatch => {
     const title = inferTitle(email);
@@ -119,14 +124,14 @@ export function rankJobs(emails: EmailJobInput[], profile: CareerProfile) {
     const combined = normalize(`${title} ${company} ${location} ${email.subject} ${email.snippet}`);
     const reasons: string[] = [];
 
-    let score = 15;
+    let score = 12;
     const rolePoints = titleScore(title, targets);
     score += rolePoints;
-    if (rolePoints >= 28) reasons.push("Strong title match");
-    else if (rolePoints >= 15) reasons.push("Related target role");
+    if (rolePoints >= 30) reasons.push("Strong title match");
+    else if (rolePoints >= 16) reasons.push("Related target role");
 
     const matchedSkills = skills.filter((skill) => combined.includes(normalize(skill)));
-    const skillPoints = Math.min(30, matchedSkills.length * 6);
+    const skillPoints = Math.min(28, matchedSkills.length * 6);
     score += skillPoints;
     if (matchedSkills.length) {
       reasons.push(`Matches skills: ${matchedSkills.slice(0, 4).join(", ")}`);
@@ -134,17 +139,31 @@ export function rankJobs(emails: EmailJobInput[], profile: CareerProfile) {
 
     const matchedLocation = locations.find((item) => combined.includes(normalize(item)));
     if (matchedLocation) {
-      score += 12;
+      score += 10;
       reasons.push(`Preferred location: ${matchedLocation}`);
     } else if (profile.remoteOkay && combined.includes("remote")) {
-      score += 12;
+      score += 10;
       reasons.push("Remote-friendly");
     }
 
     const matchedIndustries = industries.filter((item) => combined.includes(normalize(item)));
     const industryPoints = Math.min(8, matchedIndustries.length * 4);
     score += industryPoints;
-    if (matchedIndustries.length) reasons.push(`Relevant domain: ${matchedIndustries.slice(0, 2).join(", ")}`);
+    if (matchedIndustries.length) {
+      reasons.push(`Relevant domain: ${matchedIndustries.slice(0, 2).join(", ")}`);
+    }
+
+    const matchedSeniority = seniority.find((item) => combined.includes(normalize(item)));
+    if (matchedSeniority) {
+      score += 7;
+      reasons.push(`Seniority fit: ${matchedSeniority}`);
+    }
+
+    const matchedAvoid = avoid.filter((item) => combined.includes(normalize(item)));
+    if (matchedAvoid.length) {
+      score -= Math.min(30, matchedAvoid.length * 15);
+      reasons.push(`Caution: ${matchedAvoid.slice(0, 2).join(", ")}`);
+    }
 
     return {
       id: email.id,
@@ -152,7 +171,7 @@ export function rankJobs(emails: EmailJobInput[], profile: CareerProfile) {
       company,
       location,
       source: inferSource(email.from),
-      score: Math.min(100, score),
+      score: Math.max(0, Math.min(100, score)),
       reasons: reasons.length ? reasons : ["Found in a job-related email"],
       snippet: email.snippet,
       date: email.date,

@@ -4,10 +4,13 @@ import { useEffect, useMemo, useState } from "react";
 import type { CareerProfile, JobMatch } from "@/lib/job-match";
 
 const defaultProfile: CareerProfile = {
+  profileName: "My job search",
   targetRoles: "",
   skills: "",
   preferredLocations: "",
   industryKeywords: "",
+  seniorityKeywords: "",
+  avoidKeywords: "",
   remoteOkay: true,
   minimumMatch: 60,
 };
@@ -19,8 +22,37 @@ type ScanResult = {
   generatedAt: string;
 };
 
+type AuthStatus = {
+  connected: boolean;
+  email?: string | null;
+};
+
+function storageKey(email: string | null) {
+  return `job-agent-profile:${(email || "guest").toLowerCase()}`;
+}
+
+function readProfile(key: string, allowLegacy = false) {
+  const stored = window.localStorage.getItem(key);
+  const legacy = allowLegacy ? window.localStorage.getItem("job-agent-profile") : null;
+  const raw = stored || legacy;
+
+  if (!raw) return defaultProfile;
+
+  try {
+    const parsed = { ...defaultProfile, ...(JSON.parse(raw) as Partial<CareerProfile>) };
+    if (!stored && legacy) {
+      window.localStorage.setItem(key, JSON.stringify(parsed));
+      window.localStorage.removeItem("job-agent-profile");
+    }
+    return parsed;
+  } catch {
+    return defaultProfile;
+  }
+}
+
 export default function Home() {
   const [profile, setProfile] = useState<CareerProfile>(defaultProfile);
+  const [profileKey, setProfileKey] = useState<string | null>(null);
   const [connected, setConnected] = useState(false);
   const [email, setEmail] = useState<string | null>(null);
   const [jobs, setJobs] = useState<JobMatch[]>([]);
@@ -31,30 +63,38 @@ export default function Home() {
   const [hydrated, setHydrated] = useState(false);
 
   useEffect(() => {
-    const saved = window.localStorage.getItem("job-agent-profile");
-    if (saved) {
-      try {
-        setProfile({ ...defaultProfile, ...(JSON.parse(saved) as CareerProfile) });
-      } catch {
-        // Ignore malformed local data and use defaults.
-      }
-    }
-    setHydrated(true);
+    let cancelled = false;
 
-    fetch("/api/auth/status", { cache: "no-store" })
-      .then((response) => response.json())
-      .then((data: { connected: boolean; email?: string | null }) => {
-        setConnected(data.connected);
-        setEmail(data.email ?? null);
-      })
-      .catch(() => setConnected(false));
+    async function bootstrap() {
+      let status: AuthStatus = { connected: false, email: null };
+      try {
+        const response = await fetch("/api/auth/status", { cache: "no-store" });
+        status = (await response.json()) as AuthStatus;
+      } catch {
+        status = { connected: false, email: null };
+      }
+
+      if (cancelled) return;
+      const accountEmail = status.email ?? null;
+      const key = storageKey(accountEmail);
+      setConnected(status.connected);
+      setEmail(accountEmail);
+      setProfileKey(key);
+      setProfile(readProfile(key, Boolean(accountEmail)));
+      setHydrated(true);
+    }
+
+    void bootstrap();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   useEffect(() => {
-    if (hydrated) {
-      window.localStorage.setItem("job-agent-profile", JSON.stringify(profile));
+    if (hydrated && profileKey) {
+      window.localStorage.setItem(profileKey, JSON.stringify(profile));
     }
-  }, [profile, hydrated]);
+  }, [profile, profileKey, hydrated]);
 
   const highMatches = useMemo(() => jobs.filter((job) => job.score >= 80).length, [jobs]);
 
@@ -85,9 +125,21 @@ export default function Home() {
 
   async function disconnect() {
     await fetch("/api/auth/google/disconnect", { method: "POST" });
+    const guestKey = storageKey(null);
     setConnected(false);
     setEmail(null);
     setJobs([]);
+    setScanned(0);
+    setLastScan(null);
+    setProfileKey(guestKey);
+    setProfile(readProfile(guestKey));
+  }
+
+  function resetProfile() {
+    setProfile({ ...defaultProfile });
+    setJobs([]);
+    setScanned(0);
+    setLastScan(null);
   }
 
   return (
@@ -108,16 +160,16 @@ export default function Home() {
 
       <section className="hero">
         <div>
-          <p className="eyebrow">YOUR PRIVATE JOB SEARCH COPILOT</p>
+          <p className="eyebrow">PERSONAL JOB SEARCH AGENT</p>
           <h1>Turn job-alert emails into a focused shortlist.</h1>
           <p className="lede">
-            Define what you want, connect Gmail with read-only access, and scan recent job alerts.
-            The app ranks each opportunity and explains why it matches.
+            Every Gmail account gets its own career profile. Define the roles, skills, seniority,
+            locations, and deal-breakers that matter to you, then rank your recent job alerts.
           </p>
         </div>
         <div className="heroActions">
           {connected ? (
-            <button className="button secondary" onClick={disconnect}>Disconnect Gmail</button>
+            <button className="button secondary" onClick={disconnect}>Switch Gmail account</button>
           ) : (
             <a className="button primary" href="/api/auth/google/start">Connect Gmail</a>
           )}
@@ -138,8 +190,26 @@ export default function Home() {
         <aside className="panel profilePanel">
           <div className="panelHeading">
             <div><p className="eyebrow">STEP 1</p><h2>Career profile</h2></div>
-            <span className="saved">Saved locally</span>
+            <span className="saved">Personal</span>
           </div>
+
+          <div className="profileIdentity">
+            <div>
+              <strong>{profile.profileName || "My job search"}</strong>
+              <span>{email ? `Saved for ${email}` : "Connect Gmail to use a personal profile"}</span>
+            </div>
+            <button type="button" className="resetLink" onClick={resetProfile}>Reset</button>
+          </div>
+
+          <label>
+            Profile name
+            <span>Optional label</span>
+            <input
+              value={profile.profileName}
+              onChange={(event) => update("profileName", event.target.value)}
+              placeholder="My job search"
+            />
+          </label>
 
           <label>
             Target roles
@@ -172,12 +242,32 @@ export default function Home() {
           </label>
 
           <label>
+            Preferred seniority
+            <span>Levels or title keywords</span>
+            <input
+              value={profile.seniorityKeywords}
+              onChange={(event) => update("seniorityKeywords", event.target.value)}
+              placeholder="senior, staff, principal, lead"
+            />
+          </label>
+
+          <label>
             Industry keywords
-            <span>Helpful for domain-specific ranking</span>
+            <span>Domains you want to prioritize</span>
             <input
               value={profile.industryKeywords}
               onChange={(event) => update("industryKeywords", event.target.value)}
               placeholder="energy, geophysics, AI"
+            />
+          </label>
+
+          <label>
+            Deal-breaker keywords
+            <span>Lower the score when found</span>
+            <input
+              value={profile.avoidKeywords}
+              onChange={(event) => update("avoidKeywords", event.target.value)}
+              placeholder="internship, commission only, relocation required"
             />
           </label>
 
@@ -216,15 +306,18 @@ export default function Home() {
           {!connected ? (
             <div className="emptyState">
               <div className="emptyIcon">✉</div>
-              <h3>Connect Gmail to start</h3>
-              <p>The app requests Gmail read-only permission. It cannot send, delete, or edit email.</p>
+              <h3>Connect your Gmail</h3>
+              <p>
+                Each person connects their own account. The app requests Gmail read-only permission
+                and cannot send, delete, or edit email.
+              </p>
               <a className="button primary" href="/api/auth/google/start">Connect Gmail</a>
             </div>
           ) : jobs.length === 0 ? (
             <div className="emptyState">
               <div className="emptyIcon">↗</div>
-              <h3>Ready to scan</h3>
-              <p>Complete the profile, then scan the last 30 days of job-related email.</p>
+              <h3>{profile.profileName || "Your profile"} is ready</h3>
+              <p>Complete your preferences, then scan the last 30 days of job-related email.</p>
               <button className="button primary" disabled={loading} onClick={scanGmail}>
                 {loading ? "Scanning…" : "Scan job emails"}
               </button>
@@ -248,7 +341,9 @@ export default function Home() {
                       <a href={job.emailUrl} target="_blank" rel="noreferrer" className="openLink">Open email ↗</a>
                     </div>
                     <div className="reasonRow">
-                      {job.reasons.map((reason) => <span key={reason}>{reason}</span>)}
+                      {job.reasons.map((reason) => (
+                        <span className={reason.startsWith("Caution:") ? "caution" : ""} key={reason}>{reason}</span>
+                      ))}
                     </div>
                     <p className="snippet">{job.snippet}</p>
                   </div>
@@ -260,7 +355,7 @@ export default function Home() {
       </div>
 
       <footer>
-        Gmail content is processed only when you press Scan. Career-profile settings stay in this browser.
+        Gmail content is processed only when you press Scan. Profiles are separated by connected Gmail account on this device.
       </footer>
     </main>
   );

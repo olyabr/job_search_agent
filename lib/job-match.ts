@@ -116,6 +116,8 @@ export function rankJobs(emails: EmailJobInput[], profile: CareerProfile) {
   const industries = splitTerms(profile.industryKeywords);
   const seniority = splitTerms(profile.seniorityKeywords);
   const avoid = splitTerms(profile.avoidKeywords);
+  const hasPositiveCriteria =
+    targets.length + skills.length + locations.length + industries.length + seniority.length > 0;
 
   const jobs = emails.map((email): JobMatch => {
     const title = inferTitle(email);
@@ -186,7 +188,9 @@ export function rankJobs(emails: EmailJobInput[], profile: CareerProfile) {
     if (!existing || job.score > existing.score) deduped.set(key, job);
   }
 
+  const minimumScore = hasPositiveCriteria ? (profile.minimumMatch || 0) : 0;
+
   return [...deduped.values()]
-    .filter((job) => job.score >= (profile.minimumMatch || 0))
+    .filter((job) => job.score >= minimumScore)
     .sort((a, b) => b.score - a.score);
 }

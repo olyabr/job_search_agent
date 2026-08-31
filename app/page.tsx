@@ -14,7 +14,7 @@ const JOB_QUERY = [
   "newer_than:30d",
   "-in:spam",
   "-in:trash",
-  "{subject:job subject:jobs subject:opportunity subject:position subject:role subject:hiring",
+  "{subject:job subject:jobs subject:opportunity subject:position subject:role subject:hiring subject:career",
   "from:jobalert.indeed.com from:linkedin.com from:rigzonemail.com",
   "from:ziprecruiter.com from:glassdoor.com}",
 ].join(" ");
@@ -27,7 +27,7 @@ const defaultProfile: CareerProfile = {
   industryKeywords: "",
   seniorityKeywords: "",
   avoidKeywords: "",
-  remoteOkay: true,
+  remoteOkay: false,
   minimumMatch: 60,
 };
 
@@ -77,22 +77,14 @@ function storageKey(email: string) {
   return `job-agent-profile:${email.toLowerCase()}`;
 }
 
-function readProfile(key: string, allowLegacy = false) {
+function readProfile(key: string) {
   const stored = window.localStorage.getItem(key);
-  const legacy = allowLegacy ? window.localStorage.getItem("job-agent-profile") : null;
-  const raw = stored || legacy;
-
-  if (!raw) return defaultProfile;
+  if (!stored) return { ...defaultProfile };
 
   try {
-    const parsed = { ...defaultProfile, ...(JSON.parse(raw) as Partial<CareerProfile>) };
-    if (!stored && legacy) {
-      window.localStorage.setItem(key, JSON.stringify(parsed));
-      window.localStorage.removeItem("job-agent-profile");
-    }
-    return parsed;
+    return { ...defaultProfile, ...(JSON.parse(stored) as Partial<CareerProfile>) };
   } catch {
-    return defaultProfile;
+    return { ...defaultProfile };
   }
 }
 
@@ -111,7 +103,14 @@ async function gmailFetch<T>(accessToken: string, path: string) {
   });
 
   if (!response.ok) {
-    throw new Error(`Gmail request failed (${response.status}).`);
+    let detail = "";
+    try {
+      const body = (await response.json()) as { error?: { message?: string } };
+      detail = body.error?.message ?? "";
+    } catch {
+      // Keep the status-only fallback below when Google does not return JSON.
+    }
+    throw new Error(detail ? `Gmail request failed (${response.status}): ${detail}` : `Gmail request failed (${response.status}).`);
   }
   return (await response.json()) as T;
 }
@@ -184,7 +183,7 @@ export default function Home() {
       setEmail(savedEmail);
       setConnected(true);
       setProfileKey(key);
-      setProfile(readProfile(key, true));
+      setProfile(readProfile(key));
     }
     setHydrated(true);
   }, []);
@@ -195,7 +194,22 @@ export default function Home() {
     }
   }, [profile, profileKey, hydrated, connected]);
 
-  const highMatches = useMemo(() => jobs.filter((job) => job.score >= 80).length, [jobs]);
+  const profileReady = useMemo(
+    () =>
+      [
+        profile.targetRoles,
+        profile.skills,
+        profile.preferredLocations,
+        profile.industryKeywords,
+        profile.seniorityKeywords,
+      ].some((value) => value.trim().length > 0),
+    [profile],
+  );
+
+  const highMatches = useMemo(
+    () => (profileReady ? jobs.filter((job) => job.score >= 80).length : 0),
+    [jobs, profileReady],
+  );
 
   function update<K extends keyof CareerProfile>(key: K, value: CareerProfile[K]) {
     setProfile((current) => ({ ...current, [key]: value }));
@@ -249,7 +263,7 @@ export default function Home() {
     setEmail(accountEmail);
     setConnected(true);
     setProfileKey(key);
-    setProfile(readProfile(key, true));
+    setProfile(readProfile(key));
     window.sessionStorage.setItem("job-agent-google-token", token);
     window.sessionStorage.setItem("job-agent-google-expiry", String(expiresAt));
     window.sessionStorage.setItem("job-agent-google-email", accountEmail);
@@ -341,7 +355,7 @@ export default function Home() {
           <div className="brandMark">J</div>
           <div>
             <strong>Job Match Agent</strong>
-            <span>Gmail → ranked opportunities</span>
+            <span>Gmail → personalized job matches</span>
           </div>
         </div>
         <div className={`connection ${connected ? "connected" : ""}`}>
@@ -352,12 +366,12 @@ export default function Home() {
 
       <section className="hero">
         <div>
-          <p className="eyebrow">PERSONAL JOB SEARCH AGENT</p>
-          <h1>{connected ? "Turn job-alert emails into a focused shortlist." : "Connect Gmail to start your job search agent."}</h1>
+          <p className="eyebrow">JOB SEARCH, PERSONALIZED TO EACH USER</p>
+          <h1>{connected ? "Rank job alerts around your own career goals." : "Connect Gmail and build your own job-search profile."}</h1>
           <p className="lede">
             {connected
-              ? "Your Gmail account identifies your personal workspace. Define the roles, skills, seniority, locations, and deal-breakers that matter to you, then rank your recent job alerts."
-              : "Gmail is required for this app. Google grants a short-lived read-only access token directly to your browser; the app cannot send, delete, archive, or modify your email."}
+              ? "This app is not tied to any profession. Define the roles, skills, seniority, locations, industries, and deal-breakers that matter to you, then rank your recent job alerts against that profile."
+              : "Each Gmail account gets its own independent career profile. The app requests read-only Gmail access and cannot send, delete, archive, or modify email."}
           </p>
         </div>
         <div className="heroActions">
@@ -387,9 +401,9 @@ export default function Home() {
             )}
             <div className="emptyState">
               <div className="emptyIcon">✉</div>
-              <h3>Gmail sign-in is required</h3>
+              <h3>Start with your own Gmail account</h3>
               <p>
-                Connect your Google account first. The app requests only Gmail read-only access, then creates a separate career profile for that Gmail account.
+                After connecting, create a career profile for any profession or industry. Profiles are stored separately by Gmail account on this device.
               </p>
               <button className="button primary" disabled={loading || setupMissing || !googleReady} onClick={() => void connectGmail()}>
                 {setupMissing ? "Google Client ID needed" : googleReady ? "Connect Gmail" : "Loading Google sign-in…"}
@@ -402,24 +416,33 @@ export default function Home() {
           <section className="stats">
             <div className="stat"><span>Emails scanned</span><strong>{scanned}</strong></div>
             <div className="stat"><span>Matches shown</span><strong>{jobs.length}</strong></div>
-            <div className="stat"><span>80%+ matches</span><strong>{highMatches}</strong></div>
-            <div className="stat"><span>Minimum score</span><strong>{profile.minimumMatch}%</strong></div>
+            <div className="stat"><span>80%+ matches</span><strong>{profileReady ? highMatches : "—"}</strong></div>
+            <div className="stat"><span>Minimum score</span><strong>{profileReady ? `${profile.minimumMatch}%` : "Off"}</strong></div>
           </section>
 
           <div className="workspace">
             <aside className="panel profilePanel">
               <div className="panelHeading">
-                <div><p className="eyebrow">STEP 1</p><h2>Career profile</h2></div>
-                <span className="saved">Personal</span>
+                <div><p className="eyebrow">STEP 1</p><h2>Your career profile</h2></div>
+                <span className="saved">{profileReady ? "Ready to rank" : "Set preferences"}</span>
               </div>
 
               <div className="profileIdentity">
                 <div>
                   <strong>{profile.profileName || "My job search"}</strong>
-                  <span>{email ? `Saved for ${email}` : "Gmail account"}</span>
+                  <span>{email ? `Private profile for ${email}` : "Gmail account"}</span>
                 </div>
-                <button type="button" className="resetLink" onClick={resetProfile}>Reset</button>
+                <button type="button" className="resetLink" onClick={resetProfile}>Start over</button>
               </div>
+
+              {!profileReady && (
+                <div className="profileIdentity">
+                  <div>
+                    <strong>Make the matching yours</strong>
+                    <span>Add at least one target role, skill, location, industry, or seniority preference. Until then, detected job alerts are shown unranked.</span>
+                  </div>
+                </div>
+              )}
 
               <label>
                 Profile name
@@ -430,41 +453,41 @@ export default function Home() {
               <label>
                 Target roles
                 <span>One per line or comma-separated</span>
-                <textarea value={profile.targetRoles} onChange={(event) => update("targetRoles", event.target.value)} placeholder={"Senior Data Scientist\nMachine Learning Engineer\nSenior Geophysicist"} />
+                <textarea value={profile.targetRoles} onChange={(event) => update("targetRoles", event.target.value)} placeholder={"Product Manager\nRegistered Nurse\nSoftware Engineer"} />
               </label>
 
               <label>
                 Skills
-                <span>Technical and domain skills</span>
-                <textarea value={profile.skills} onChange={(event) => update("skills", event.target.value)} placeholder="Python, PyTorch, machine learning, seismic interpretation" />
+                <span>Any professional or domain skills</span>
+                <textarea value={profile.skills} onChange={(event) => update("skills", event.target.value)} placeholder="project management, Excel, React, patient care" />
               </label>
 
               <label>
                 Preferred locations
-                <span>Cities, states, or regions</span>
-                <textarea value={profile.preferredLocations} onChange={(event) => update("preferredLocations", event.target.value)} placeholder={"Houston, TX\nTexas"} />
+                <span>Cities, states, countries, or regions</span>
+                <textarea value={profile.preferredLocations} onChange={(event) => update("preferredLocations", event.target.value)} placeholder={"Chicago, IL\nLondon\nBay Area"} />
               </label>
 
               <label>
                 Preferred seniority
                 <span>Levels or title keywords</span>
-                <input value={profile.seniorityKeywords} onChange={(event) => update("seniorityKeywords", event.target.value)} placeholder="senior, staff, principal, lead" />
+                <input value={profile.seniorityKeywords} onChange={(event) => update("seniorityKeywords", event.target.value)} placeholder="entry level, mid-level, senior, manager" />
               </label>
 
               <label>
                 Industry keywords
-                <span>Domains you want to prioritize</span>
-                <input value={profile.industryKeywords} onChange={(event) => update("industryKeywords", event.target.value)} placeholder="energy, geophysics, AI" />
+                <span>Fields you want to prioritize</span>
+                <input value={profile.industryKeywords} onChange={(event) => update("industryKeywords", event.target.value)} placeholder="healthcare, finance, technology, education" />
               </label>
 
               <label>
                 Deal-breaker keywords
                 <span>Lower the score when found</span>
-                <input value={profile.avoidKeywords} onChange={(event) => update("avoidKeywords", event.target.value)} placeholder="internship, commission only, relocation required" />
+                <input value={profile.avoidKeywords} onChange={(event) => update("avoidKeywords", event.target.value)} placeholder="contract, travel required, nights, relocation required" />
               </label>
 
               <div className="toggleRow">
-                <div><strong>Remote roles</strong><span>Include remote jobs as preferred</span></div>
+                <div><strong>Prefer remote roles</strong><span>Give remote jobs a location-match bonus</span></div>
                 <button type="button" className={`toggle ${profile.remoteOkay ? "on" : ""}`} aria-pressed={profile.remoteOkay} onClick={() => update("remoteOkay", !profile.remoteOkay)}><span /></button>
               </div>
 
@@ -476,7 +499,7 @@ export default function Home() {
 
             <section className="panel resultsPanel">
               <div className="panelHeading">
-                <div><p className="eyebrow">STEP 2</p><h2>Best matches</h2></div>
+                <div><p className="eyebrow">STEP 2</p><h2>{profileReady ? "Best matches" : "Detected job alerts"}</h2></div>
                 {lastScan && <span className="saved">Updated {new Date(lastScan).toLocaleString()}</span>}
               </div>
 
@@ -485,8 +508,12 @@ export default function Home() {
               {jobs.length === 0 ? (
                 <div className="emptyState">
                   <div className="emptyIcon">↗</div>
-                  <h3>{profile.profileName || "Your profile"} is ready</h3>
-                  <p>Complete your preferences, then scan the last 30 days of job-related email.</p>
+                  <h3>{profileReady ? "Your profile is ready" : "Your workspace is ready"}</h3>
+                  <p>
+                    {profileReady
+                      ? "Scan the last 30 days of job-related email to rank opportunities against your preferences."
+                      : "You can scan now to see detected alerts, or add preferences first to get personalized match scores."}
+                  </p>
                   <button className="button primary" disabled={loading} onClick={scanGmail}>{loading ? "Scanning…" : "Scan job emails"}</button>
                 </div>
               ) : (
@@ -494,8 +521,12 @@ export default function Home() {
                   {jobs.map((job) => (
                     <article className="jobCard" key={job.id}>
                       <div className="scoreWrap">
-                        <div className={`score ${job.score >= 80 ? "great" : job.score >= 65 ? "good" : "fair"}`}>{job.score}<small>%</small></div>
-                        <span>match</span>
+                        {profileReady ? (
+                          <div className={`score ${job.score >= 80 ? "great" : job.score >= 65 ? "good" : "fair"}`}>{job.score}<small>%</small></div>
+                        ) : (
+                          <div className="score fair">—</div>
+                        )}
+                        <span>{profileReady ? "match" : "unranked"}</span>
                       </div>
                       <div className="jobBody">
                         <div className="jobTopline">
@@ -503,7 +534,9 @@ export default function Home() {
                           <a href={job.emailUrl} target="_blank" rel="noreferrer" className="openLink">Open email ↗</a>
                         </div>
                         <div className="reasonRow">
-                          {job.reasons.map((reason) => <span className={reason.startsWith("Caution:") ? "caution" : ""} key={reason}>{reason}</span>)}
+                          {profileReady
+                            ? job.reasons.map((reason) => <span className={reason.startsWith("Caution:") ? "caution" : ""} key={reason}>{reason}</span>)
+                            : <span>Add profile preferences to rank this job</span>}
                         </div>
                         <p className="snippet">{job.snippet}</p>
                       </div>
@@ -517,7 +550,7 @@ export default function Home() {
       )}
 
       <footer>
-        Gmail is required and accessed read-only. Google access tokens stay in the browser session and career profiles are separated by Gmail account on this device.
+        Each Gmail account has its own career profile on this device. Gmail is accessed read-only, and Google access tokens stay in the browser session.
       </footer>
     </main>
   );

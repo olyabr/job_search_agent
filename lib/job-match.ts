@@ -16,6 +16,11 @@ export type EmailJobInput = {
   from: string;
   snippet: string;
   date?: string;
+  title?: string;
+  company?: string;
+  location?: string;
+  source?: string;
+  applyUrl?: string;
 };
 
 export type JobMatch = {
@@ -28,7 +33,8 @@ export type JobMatch = {
   reasons: string[];
   snippet: string;
   date?: string;
-  emailUrl: string;
+  applyUrl: string;
+  emailUrl?: string;
 };
 
 function splitTerms(value = "") {
@@ -42,17 +48,25 @@ function normalize(value: string) {
   return value.toLowerCase().replace(/[^a-z0-9+#. ]/g, " ").replace(/\s+/g, " ").trim();
 }
 
-function inferSource(from: string) {
-  const text = from.toLowerCase();
+function inferSource(email: EmailJobInput) {
+  if (email.source) return email.source;
+  const text = `${email.from} ${email.applyUrl ?? ""}`.toLowerCase();
   if (text.includes("indeed")) return "Indeed";
   if (text.includes("linkedin")) return "LinkedIn";
   if (text.includes("rigzone")) return "Rigzone";
   if (text.includes("ziprecruiter")) return "ZipRecruiter";
   if (text.includes("glassdoor")) return "Glassdoor";
-  return "Email alert";
+  if (text.includes("remotive")) return "Remotive";
+  if (text.includes("greenhouse")) return "Company careers";
+  if (text.includes("lever.co")) return "Company careers";
+  if (text.includes("workday")) return "Company careers";
+  if (text.includes("smartrecruiters")) return "Company careers";
+  return "Company / job board";
 }
 
 function inferTitle(email: EmailJobInput) {
+  if (email.title?.trim()) return email.title.trim();
+
   const indeed = email.subject.match(/^\d+\s+new\s+(.+?)\s+jobs?\s+in\s+/i);
   if (indeed?.[1]) return indeed[1].trim();
 
@@ -69,16 +83,20 @@ function inferTitle(email: EmailJobInput) {
 }
 
 function inferCompany(email: EmailJobInput) {
+  if (email.company?.trim()) return email.company.trim();
+
   const linkedin = email.subject.match(/^.+?:\s+(.+?)\s+hired near you/i);
   if (linkedin?.[1]) return linkedin[1].trim();
 
   const accepting = email.snippet.match(/\b([A-Z][A-Za-z0-9&.' -]{1,45}?)\s+is accepting online applications/i);
   if (accepting?.[1]) return accepting[1].trim();
 
-  return inferSource(email.from);
+  return inferSource(email);
 }
 
 function inferLocation(email: EmailJobInput) {
+  if (email.location?.trim()) return email.location.trim();
+
   const subjectLocation = email.subject.match(/\s+in\s+([^|]+)$/i);
   if (subjectLocation?.[1]) return subjectLocation[1].trim();
 
@@ -109,7 +127,7 @@ function titleScore(title: string, targetRoles: string[]) {
   return best;
 }
 
-export function rankJobs(emails: EmailJobInput[], profile: CareerProfile) {
+export function rankJobs(inputs: EmailJobInput[], profile: CareerProfile) {
   const targets = splitTerms(profile.targetRoles);
   const skills = splitTerms(profile.skills);
   const locations = splitTerms(profile.preferredLocations);
@@ -119,67 +137,70 @@ export function rankJobs(emails: EmailJobInput[], profile: CareerProfile) {
   const hasPositiveCriteria =
     targets.length + skills.length + locations.length + industries.length + seniority.length > 0;
 
-  const jobs = emails.map((email): JobMatch => {
-    const title = inferTitle(email);
-    const company = inferCompany(email);
-    const location = inferLocation(email);
-    const combined = normalize(`${title} ${company} ${location} ${email.subject} ${email.snippet}`);
-    const reasons: string[] = [];
+  const jobs = inputs
+    .filter((input) => Boolean(input.applyUrl))
+    .map((input): JobMatch => {
+      const title = inferTitle(input);
+      const company = inferCompany(input);
+      const location = inferLocation(input);
+      const source = inferSource(input);
+      const combined = normalize(`${title} ${company} ${location} ${input.subject} ${input.snippet}`);
+      const reasons: string[] = [];
 
-    let score = 12;
-    const rolePoints = titleScore(title, targets);
-    score += rolePoints;
-    if (rolePoints >= 30) reasons.push("Strong title match");
-    else if (rolePoints >= 16) reasons.push("Related target role");
+      let score = 12;
+      const rolePoints = titleScore(title, targets);
+      score += rolePoints;
+      if (rolePoints >= 30) reasons.push("Strong title match");
+      else if (rolePoints >= 16) reasons.push("Related target role");
 
-    const matchedSkills = skills.filter((skill) => combined.includes(normalize(skill)));
-    const skillPoints = Math.min(28, matchedSkills.length * 6);
-    score += skillPoints;
-    if (matchedSkills.length) {
-      reasons.push(`Matches skills: ${matchedSkills.slice(0, 4).join(", ")}`);
-    }
+      const matchedSkills = skills.filter((skill) => combined.includes(normalize(skill)));
+      const skillPoints = Math.min(28, matchedSkills.length * 6);
+      score += skillPoints;
+      if (matchedSkills.length) reasons.push(`Matches skills: ${matchedSkills.slice(0, 4).join(", ")}`);
 
-    const matchedLocation = locations.find((item) => combined.includes(normalize(item)));
-    if (matchedLocation) {
-      score += 10;
-      reasons.push(`Preferred location: ${matchedLocation}`);
-    } else if (profile.remoteOkay && combined.includes("remote")) {
-      score += 10;
-      reasons.push("Remote-friendly");
-    }
+      const matchedLocation = locations.find((item) => combined.includes(normalize(item)));
+      if (matchedLocation) {
+        score += 10;
+        reasons.push(`Preferred location: ${matchedLocation}`);
+      } else if (profile.remoteOkay && combined.includes("remote")) {
+        score += 10;
+        reasons.push("Remote-friendly");
+      }
 
-    const matchedIndustries = industries.filter((item) => combined.includes(normalize(item)));
-    const industryPoints = Math.min(8, matchedIndustries.length * 4);
-    score += industryPoints;
-    if (matchedIndustries.length) {
-      reasons.push(`Relevant domain: ${matchedIndustries.slice(0, 2).join(", ")}`);
-    }
+      const matchedIndustries = industries.filter((item) => combined.includes(normalize(item)));
+      const industryPoints = Math.min(8, matchedIndustries.length * 4);
+      score += industryPoints;
+      if (matchedIndustries.length) reasons.push(`Relevant domain: ${matchedIndustries.slice(0, 2).join(", ")}`);
 
-    const matchedSeniority = seniority.find((item) => combined.includes(normalize(item)));
-    if (matchedSeniority) {
-      score += 7;
-      reasons.push(`Seniority fit: ${matchedSeniority}`);
-    }
+      const matchedSeniority = seniority.find((item) => combined.includes(normalize(item)));
+      if (matchedSeniority) {
+        score += 7;
+        reasons.push(`Seniority fit: ${matchedSeniority}`);
+      }
 
-    const matchedAvoid = avoid.filter((item) => combined.includes(normalize(item)));
-    if (matchedAvoid.length) {
-      score -= Math.min(30, matchedAvoid.length * 15);
-      reasons.push(`Caution: ${matchedAvoid.slice(0, 2).join(", ")}`);
-    }
+      const matchedAvoid = avoid.filter((item) => combined.includes(normalize(item)));
+      if (matchedAvoid.length) {
+        score -= Math.min(30, matchedAvoid.length * 15);
+        reasons.push(`Caution: ${matchedAvoid.slice(0, 2).join(", ")}`);
+      }
 
-    return {
-      id: email.id,
-      title,
-      company,
-      location,
-      source: inferSource(email.from),
-      score: Math.max(0, Math.min(100, score)),
-      reasons: reasons.length ? reasons : ["Found in a job-related email"],
-      snippet: email.snippet,
-      date: email.date,
-      emailUrl: `https://mail.google.com/mail/u/0/#all/${email.id}`,
-    };
-  });
+      if (source === "Remotive") reasons.push("Live job listing");
+      else reasons.push("Direct application link found");
+
+      return {
+        id: input.id,
+        title,
+        company,
+        location,
+        source,
+        score: Math.max(0, Math.min(100, score)),
+        reasons,
+        snippet: input.snippet,
+        date: input.date,
+        applyUrl: input.applyUrl as string,
+        emailUrl: input.from ? `https://mail.google.com/mail/u/0/#all/${input.id.split(":")[0]}` : undefined,
+      };
+    });
 
   const deduped = new Map<string, JobMatch>();
   for (const job of jobs) {

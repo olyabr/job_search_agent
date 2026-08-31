@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { ChangeEvent, useEffect, useMemo, useState } from "react";
 import {
   rankJobs,
   type CareerProfile,
@@ -10,6 +10,7 @@ import {
 
 const GOOGLE_CLIENT_ID = "1000693491801-93th0r0hrdsd7iol5an9jl1ks46s5gp1.apps.googleusercontent.com";
 const GMAIL_READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly";
+const GUEST_PROFILE_KEY = "job-agent-profile:guest";
 const JOB_QUERY = [
   "newer_than:30d",
   "-in:spam",
@@ -64,13 +65,25 @@ type GoogleWindow = Window & {
 
 type GmailList = { messages?: Array<{ id: string }> };
 type GmailProfile = { emailAddress?: string };
+type GmailPart = {
+  mimeType?: string;
+  body?: { data?: string };
+  parts?: GmailPart[];
+};
 type GmailMessage = {
   id: string;
   snippet?: string;
   internalDate?: string;
-  payload?: {
+  payload?: GmailPart & {
     headers?: Array<{ name: string; value: string }>;
   };
+};
+
+type LiveJobsResponse = { jobs?: EmailJobInput[]; error?: string };
+type ResumeResponse = {
+  fileName?: string;
+  profile?: Partial<CareerProfile>;
+  error?: string;
 };
 
 function storageKey(email: string) {
@@ -80,7 +93,6 @@ function storageKey(email: string) {
 function readProfile(key: string) {
   const stored = window.localStorage.getItem(key);
   if (!stored) return { ...defaultProfile };
-
   try {
     return { ...defaultProfile, ...(JSON.parse(stored) as Partial<CareerProfile>) };
   } catch {
@@ -108,7 +120,7 @@ async function gmailFetch<T>(accessToken: string, path: string) {
       const body = (await response.json()) as { error?: { message?: string } };
       detail = body.error?.message ?? "";
     } catch {
-      // Keep the status-only fallback below when Google does not return JSON.
+      // Keep the status-only fallback.
     }
     throw new Error(detail ? `Gmail request failed (${response.status}): ${detail}` : `Gmail request failed (${response.status}).`);
   }
@@ -121,26 +133,115 @@ function getHeader(message: GmailMessage, name: string) {
   )?.value ?? "";
 }
 
+function decodeGmailData(data = "") {
+  if (!data) return "";
+  try {
+    const normalized = data.replace(/-/g, "+").replace(/_/g, "/");
+    const binary = window.atob(normalized);
+    const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+    return new TextDecoder().decode(bytes);
+  } catch {
+    return "";
+  }
+}
+
+function collectBodies(part?: GmailPart): { html: string; text: string } {
+  if (!part) return { html: "", text: "" };
+  let html = "";
+  let text = "";
+  const own = decodeGmailData(part.body?.data);
+  if (own) {
+    if (part.mimeType?.includes("html")) html += own;
+    else if (part.mimeType?.startsWith("text/")) text += own;
+  }
+  for (const child of part.parts ?? []) {
+    const nested = collectBodies(child);
+    html += `\n${nested.html}`;
+    text += `\n${nested.text}`;
+  }
+  return { html, text };
+}
+
+function cleanUrl(value: string) {
+  return value
+    .replace(/&amp;/g, "&")
+    .replace(/[)>.,]+$/, "")
+    .trim();
+}
+
+function looksLikeJobUrl(url: string) {
+  const lower = url.toLowerCase();
+  if (!/^https?:\/\//.test(lower)) return false;
+  if (/unsubscribe|preferences|privacy|support|help|logo|image|pixel|tracking/.test(lower)) return false;
+  return /job|jobs|career|careers|position|opening|apply|indeed|linkedin|ziprecruiter|glassdoor|greenhouse|lever\.co|workday|smartrecruiters|myworkdayjobs/.test(lower);
+}
+
+function extractJobLinks(message: GmailMessage) {
+  const { html, text } = collectBodies(message.payload);
+  const links: Array<{ url: string; label: string }> = [];
+
+  if (html) {
+    try {
+      const doc = new DOMParser().parseFromString(html, "text/html");
+      for (const anchor of Array.from(doc.querySelectorAll<HTMLAnchorElement>("a[href]"))) {
+        const url = cleanUrl(anchor.href);
+        const label = anchor.textContent?.replace(/\s+/g, " ").trim() ?? "";
+        if (looksLikeJobUrl(url)) links.push({ url, label });
+      }
+    } catch {
+      // Plain-text URL extraction below still runs.
+    }
+  }
+
+  const textUrls = `${text}\n${html}`.match(/https?:\/\/[^\s"'<>]+/gi) ?? [];
+  for (const raw of textUrls) {
+    const url = cleanUrl(raw);
+    if (looksLikeJobUrl(url)) links.push({ url, label: "" });
+  }
+
+  const seen = new Set<string>();
+  return links
+    .filter(({ url }) => {
+      if (seen.has(url)) return false;
+      seen.add(url);
+      return true;
+    })
+    .slice(0, 8);
+}
+
 async function loadMessages(accessToken: string, ids: string[]) {
   const output: GmailMessage[] = [];
-  for (let index = 0; index < ids.length; index += 10) {
-    const batch = ids.slice(index, index + 10);
+  for (let index = 0; index < ids.length; index += 8) {
+    const batch = ids.slice(index, index + 8);
     const messages = await Promise.all(
-      batch.map((id) =>
-        gmailFetch<GmailMessage>(
-          accessToken,
-          `messages/${id}?format=metadata&metadataHeaders=Subject&metadataHeaders=From&metadataHeaders=Date`,
-        ),
-      ),
+      batch.map((id) => gmailFetch<GmailMessage>(accessToken, `messages/${id}?format=full`)),
     );
     output.push(...messages);
   }
   return output;
 }
 
+function firstTerm(value: string) {
+  return value.split(/[\n,;]+/).map((item) => item.trim()).find(Boolean) ?? "";
+}
+
+function jobBoardLinks(profile: CareerProfile) {
+  const role = firstTerm(profile.targetRoles) || firstTerm(profile.skills) || "jobs";
+  const location = firstTerm(profile.preferredLocations);
+  const q = encodeURIComponent(role);
+  const l = encodeURIComponent(location);
+  return [
+    { name: "Indeed", href: `https://www.indeed.com/jobs?q=${q}${location ? `&l=${l}` : ""}` },
+    { name: "LinkedIn", href: `https://www.linkedin.com/jobs/search/?keywords=${q}${location ? `&location=${l}` : ""}` },
+    { name: "ZipRecruiter", href: `https://www.ziprecruiter.com/jobs-search?search=${q}${location ? `&location=${l}` : ""}` },
+    { name: "Glassdoor", href: `https://www.glassdoor.com/Job/jobs.htm?sc.keyword=${q}` },
+    { name: "Google Jobs", href: `https://www.google.com/search?q=${encodeURIComponent(`${role} jobs ${location}`.trim())}` },
+  ];
+}
+
 export default function Home() {
   const [profile, setProfile] = useState<CareerProfile>(defaultProfile);
-  const [profileKey, setProfileKey] = useState<string | null>(null);
+  const [profileKey, setProfileKey] = useState(GUEST_PROFILE_KEY);
   const [connected, setConnected] = useState(false);
   const [email, setEmail] = useState<string | null>(null);
   const [accessToken, setAccessToken] = useState<string | null>(null);
@@ -148,7 +249,10 @@ export default function Home() {
   const [googleReady, setGoogleReady] = useState(false);
   const [jobs, setJobs] = useState<JobMatch[]>([]);
   const [scanned, setScanned] = useState(0);
+  const [liveJobs, setLiveJobs] = useState(0);
   const [loading, setLoading] = useState(false);
+  const [resumeLoading, setResumeLoading] = useState(false);
+  const [resumeStatus, setResumeStatus] = useState("");
   const [error, setError] = useState("");
   const [lastScan, setLastScan] = useState<string | null>(null);
   const [hydrated, setHydrated] = useState(false);
@@ -158,20 +262,17 @@ export default function Home() {
     if (existing) {
       if (getGoogleOAuth()) setGoogleReady(true);
       else existing.addEventListener("load", () => setGoogleReady(true), { once: true });
-      return;
+    } else {
+      const script = document.createElement("script");
+      script.src = "https://accounts.google.com/gsi/client";
+      script.async = true;
+      script.defer = true;
+      script.dataset.googleIdentity = "true";
+      script.onload = () => setGoogleReady(true);
+      script.onerror = () => setError("Could not load Google sign-in. You can still search jobs without Gmail.");
+      document.head.appendChild(script);
     }
 
-    const script = document.createElement("script");
-    script.src = "https://accounts.google.com/gsi/client";
-    script.async = true;
-    script.defer = true;
-    script.dataset.googleIdentity = "true";
-    script.onload = () => setGoogleReady(true);
-    script.onerror = () => setError("Could not load Google sign-in. Please refresh the page.");
-    document.head.appendChild(script);
-  }, []);
-
-  useEffect(() => {
     const savedToken = window.sessionStorage.getItem("job-agent-google-token");
     const savedExpiry = Number(window.sessionStorage.getItem("job-agent-google-expiry") || 0);
     const savedEmail = window.sessionStorage.getItem("job-agent-google-email");
@@ -184,25 +285,20 @@ export default function Home() {
       setConnected(true);
       setProfileKey(key);
       setProfile(readProfile(key));
+    } else {
+      setProfileKey(GUEST_PROFILE_KEY);
+      setProfile(readProfile(GUEST_PROFILE_KEY));
     }
     setHydrated(true);
   }, []);
 
   useEffect(() => {
-    if (hydrated && connected && profileKey) {
-      window.localStorage.setItem(profileKey, JSON.stringify(profile));
-    }
-  }, [profile, profileKey, hydrated, connected]);
+    if (hydrated) window.localStorage.setItem(profileKey, JSON.stringify(profile));
+  }, [profile, profileKey, hydrated]);
 
   const profileReady = useMemo(
-    () =>
-      [
-        profile.targetRoles,
-        profile.skills,
-        profile.preferredLocations,
-        profile.industryKeywords,
-        profile.seniorityKeywords,
-      ].some((value) => value.trim().length > 0),
+    () => [profile.targetRoles, profile.skills, profile.preferredLocations, profile.industryKeywords, profile.seniorityKeywords]
+      .some((value) => value.trim().length > 0),
     [profile],
   );
 
@@ -210,6 +306,7 @@ export default function Home() {
     () => (profileReady ? jobs.filter((job) => job.score >= 80).length : 0),
     [jobs, profileReady],
   );
+  const boards = useMemo(() => jobBoardLinks(profile), [profile]);
 
   function update<K extends keyof CareerProfile>(key: K, value: CareerProfile[K]) {
     setProfile((current) => ({ ...current, [key]: value }));
@@ -217,16 +314,9 @@ export default function Home() {
 
   function requestGoogleToken(prompt = "") {
     return new Promise<{ token: string; expiresAt: number }>((resolve, reject) => {
-      if (!clientConfigured()) {
-        reject(new Error("Google OAuth Client ID has not been added to the app yet."));
-        return;
-      }
-
+      if (!clientConfigured()) return reject(new Error("Google OAuth Client ID has not been added to the app yet."));
       const oauth = getGoogleOAuth();
-      if (!googleReady || !oauth) {
-        reject(new Error("Google sign-in is still loading. Please try again."));
-        return;
-      }
+      if (!googleReady || !oauth) return reject(new Error("Google sign-in is still loading. Please try again."));
 
       const client = oauth.initTokenClient({
         client_id: GOOGLE_CLIENT_ID,
@@ -237,7 +327,7 @@ export default function Home() {
             return;
           }
           if (!oauth.hasGrantedAllScopes(response, GMAIL_READONLY_SCOPE)) {
-            reject(new Error("Gmail read-only permission is required to use this app."));
+            reject(new Error("Gmail read-only permission is required to scan job alerts."));
             return;
           }
           resolve({
@@ -247,7 +337,6 @@ export default function Home() {
         },
         error_callback: () => reject(new Error("Google sign-in was closed or could not open.")),
       });
-
       client.requestAccessToken(prompt ? { prompt } : undefined);
     });
   }
@@ -258,12 +347,15 @@ export default function Home() {
     if (!accountEmail) throw new Error("Could not identify the connected Gmail account.");
 
     const key = storageKey(accountEmail);
+    const existing = window.localStorage.getItem(key);
+    if (existing) setProfile(readProfile(key));
+    else window.localStorage.setItem(key, JSON.stringify(profile));
+
     setAccessToken(token);
     setTokenExpiresAt(expiresAt);
     setEmail(accountEmail);
     setConnected(true);
     setProfileKey(key);
-    setProfile(readProfile(key));
     window.sessionStorage.setItem("job-agent-google-token", token);
     window.sessionStorage.setItem("job-agent-google-expiry", String(expiresAt));
     window.sessionStorage.setItem("job-agent-google-email", accountEmail);
@@ -289,34 +381,94 @@ export default function Home() {
     return auth.token;
   }
 
-  async function scanGmail() {
-    if (!connected) return;
+  async function gmailOpportunities() {
+    if (!connected) return { inputs: [] as EmailJobInput[], messages: 0 };
+    const token = await ensureToken();
+    const params = new URLSearchParams({ q: JOB_QUERY, maxResults: "40" });
+    const list = await gmailFetch<GmailList>(token, `messages?${params.toString()}`);
+    const ids = (list.messages ?? []).map((message) => message.id).slice(0, 40);
+    const messages = await loadMessages(token, ids);
+
+    const inputs = messages.flatMap((message): EmailJobInput[] => {
+      const subject = getHeader(message, "Subject");
+      const from = getHeader(message, "From");
+      const date = getHeader(message, "Date") ||
+        (message.internalDate ? new Date(Number(message.internalDate)).toISOString() : undefined);
+      const links = extractJobLinks(message);
+      return links.map((link, index) => ({
+        id: `${message.id}:${index}`,
+        subject: link.label && !/^(apply|view|see|learn|click|job)$/i.test(link.label) ? link.label : subject,
+        title: link.label && link.label.length > 3 && link.label.length < 120 && !/apply|view job|learn more/i.test(link.label) ? link.label : undefined,
+        from,
+        snippet: message.snippet ?? "",
+        date,
+        applyUrl: link.url,
+      }));
+    });
+
+    return { inputs, messages: messages.length };
+  }
+
+  async function liveOpportunities() {
+    const search = firstTerm(profile.targetRoles) || firstTerm(profile.skills);
+    const response = await fetch(`/api/jobs/remotive?search=${encodeURIComponent(search)}`, { cache: "no-store" });
+    const payload = (await response.json()) as LiveJobsResponse;
+    if (!response.ok) throw new Error(payload.error || "Could not load live jobs.");
+    return payload.jobs ?? [];
+  }
+
+  async function findJobs() {
     setLoading(true);
     setError("");
     try {
-      const token = await ensureToken();
-      const params = new URLSearchParams({ q: JOB_QUERY, maxResults: "50" });
-      const list = await gmailFetch<GmailList>(token, `messages?${params.toString()}`);
-      const ids = (list.messages ?? []).map((message) => message.id).slice(0, 50);
-      const messages = await loadMessages(token, ids);
+      const [gmailResult, currentJobs] = await Promise.all([
+        gmailOpportunities().catch((gmailError) => {
+          setError(gmailError instanceof Error ? `Gmail alerts could not be scanned: ${gmailError.message}` : "Gmail alerts could not be scanned.");
+          return { inputs: [] as EmailJobInput[], messages: 0 };
+        }),
+        liveOpportunities(),
+      ]);
 
-      const emailJobs: EmailJobInput[] = messages.map((message) => ({
-        id: message.id,
-        subject: getHeader(message, "Subject"),
-        from: getHeader(message, "From"),
-        snippet: message.snippet ?? "",
-        date: getHeader(message, "Date") ||
-          (message.internalDate ? new Date(Number(message.internalDate)).toISOString() : undefined),
-      }));
-
-      const ranked = rankJobs(emailJobs, profile).slice(0, 40);
-      setJobs(ranked);
-      setScanned(messages.length);
+      setScanned(gmailResult.messages);
+      setLiveJobs(currentJobs.length);
+      setJobs(rankJobs([...gmailResult.inputs, ...currentJobs], profile).slice(0, 50));
       setLastScan(new Date().toISOString());
-    } catch (scanError) {
-      setError(scanError instanceof Error ? scanError.message : "Could not scan Gmail.");
+    } catch (searchError) {
+      setError(searchError instanceof Error ? searchError.message : "Could not find jobs.");
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function importResume(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+
+    setResumeLoading(true);
+    setResumeStatus("");
+    setError("");
+    try {
+      const formData = new FormData();
+      formData.append("resume", file);
+      const response = await fetch("/api/profile/resume", { method: "POST", body: formData });
+      const payload = (await response.json()) as ResumeResponse;
+      if (!response.ok || !payload.profile) throw new Error(payload.error || "Could not read resume.");
+
+      setProfile((current) => ({
+        ...current,
+        profileName: payload.profile?.profileName || current.profileName,
+        targetRoles: payload.profile?.targetRoles || current.targetRoles,
+        skills: payload.profile?.skills || current.skills,
+        seniorityKeywords: payload.profile?.seniorityKeywords || current.seniorityKeywords,
+        industryKeywords: payload.profile?.industryKeywords || current.industryKeywords,
+      }));
+      setJobs([]);
+      setResumeStatus(`Imported ${payload.fileName || file.name}. Review the suggested profile below, then find jobs.`);
+    } catch (resumeError) {
+      setError(resumeError instanceof Error ? resumeError.message : "Could not import resume.");
+    } finally {
+      setResumeLoading(false);
     }
   }
 
@@ -324,7 +476,6 @@ export default function Home() {
     const token = accessToken;
     const oauth = getGoogleOAuth();
     if (token && oauth) oauth.revoke(token);
-
     window.sessionStorage.removeItem("job-agent-google-token");
     window.sessionStorage.removeItem("job-agent-google-expiry");
     window.sessionStorage.removeItem("job-agent-google-email");
@@ -332,21 +483,18 @@ export default function Home() {
     setTokenExpiresAt(0);
     setConnected(false);
     setEmail(null);
-    setJobs([]);
-    setScanned(0);
-    setLastScan(null);
-    setProfileKey(null);
-    setProfile({ ...defaultProfile });
+    setProfileKey(GUEST_PROFILE_KEY);
+    setProfile(readProfile(GUEST_PROFILE_KEY));
   }
 
   function resetProfile() {
     setProfile({ ...defaultProfile });
     setJobs([]);
     setScanned(0);
+    setLiveJobs(0);
     setLastScan(null);
+    setResumeStatus("");
   }
-
-  const setupMissing = !clientConfigured();
 
   return (
     <main className="shell">
@@ -355,202 +503,185 @@ export default function Home() {
           <div className="brandMark">J</div>
           <div>
             <strong>Job Match Agent</strong>
-            <span>Gmail → personalized job matches</span>
+            <span>Profile → actionable jobs → apply</span>
           </div>
         </div>
         <div className={`connection ${connected ? "connected" : ""}`}>
           <span className="dot" />
-          {connected ? email || "Gmail connected" : "Gmail required"}
+          {connected ? email || "Gmail connected" : "Gmail optional"}
         </div>
       </header>
 
       <section className="hero">
         <div>
-          <p className="eyebrow">JOB SEARCH, PERSONALIZED TO EACH USER</p>
-          <h1>{connected ? "Rank job alerts around your own career goals." : "Connect Gmail and build your own job-search profile."}</h1>
+          <p className="eyebrow">ACTIONABLE JOB SEARCH</p>
+          <h1>Find jobs that fit — and apply to them.</h1>
           <p className="lede">
-            {connected
-              ? "This app is not tied to any profession. Define the roles, skills, seniority, locations, industries, and deal-breakers that matter to you, then rank your recent job alerts against that profile."
-              : "Each Gmail account gets its own independent career profile. The app requests read-only Gmail access and cannot send, delete, archive, or modify email."}
+            Build a profile manually or import a resume. The app ranks real opportunities with application links, searches a live job feed, and can optionally add jobs found in Gmail alerts.
           </p>
         </div>
         <div className="heroActions">
+          <button className="button primary" disabled={loading} onClick={findJobs}>{loading ? "Finding jobs…" : "Find recommended jobs"}</button>
           {connected ? (
-            <>
-              <button className="button secondary" onClick={() => void connectGmail(true)} disabled={loading}>Switch Gmail account</button>
-              <button className="button primary" disabled={loading} onClick={scanGmail}>
-                {loading ? "Working…" : "Scan job emails"}
-              </button>
-            </>
+            <button className="button secondary" onClick={disconnect}>Disconnect Gmail</button>
           ) : (
-            <button className="button primary" disabled={loading || setupMissing || !googleReady} onClick={() => void connectGmail()}>
-              {loading ? "Connecting…" : "Connect Gmail to continue"}
-            </button>
+            <button className="button secondary" disabled={loading || !googleReady} onClick={() => void connectGmail()}>{googleReady ? "Add Gmail alerts" : "Loading Gmail…"}</button>
           )}
         </div>
       </section>
 
-      {!connected ? (
-        <div className="workspace" style={{ gridTemplateColumns: "1fr", marginTop: 18 }}>
-          <section className="panel resultsPanel">
-            {error && <div className="alert">{error}</div>}
-            {setupMissing && (
-              <div className="alert">
-                One setup item remains: add the Google Web OAuth Client ID to the app. No client secret or Vercel environment variables are required.
-              </div>
-            )}
-            <div className="emptyState">
-              <div className="emptyIcon">✉</div>
-              <h3>Start with your own Gmail account</h3>
-              <p>
-                After connecting, create a career profile for any profession or industry. Profiles are stored separately by Gmail account on this device.
-              </p>
-              <button className="button primary" disabled={loading || setupMissing || !googleReady} onClick={() => void connectGmail()}>
-                {setupMissing ? "Google Client ID needed" : googleReady ? "Connect Gmail" : "Loading Google sign-in…"}
-              </button>
-            </div>
-          </section>
-        </div>
-      ) : (
-        <>
-          <section className="stats">
-            <div className="stat"><span>Emails scanned</span><strong>{scanned}</strong></div>
-            <div className="stat"><span>Matches shown</span><strong>{jobs.length}</strong></div>
-            <div className="stat"><span>80%+ matches</span><strong>{profileReady ? highMatches : "—"}</strong></div>
-            <div className="stat"><span>Minimum score</span><strong>{profileReady ? `${profile.minimumMatch}%` : "Off"}</strong></div>
-          </section>
+      <section className="stats">
+        <div className="stat"><span>Live jobs loaded</span><strong>{liveJobs}</strong></div>
+        <div className="stat"><span>Gmail alerts scanned</span><strong>{connected ? scanned : "—"}</strong></div>
+        <div className="stat"><span>Recommended jobs</span><strong>{jobs.length}</strong></div>
+        <div className="stat"><span>80%+ matches</span><strong>{profileReady ? highMatches : "—"}</strong></div>
+      </section>
 
-          <div className="workspace">
-            <aside className="panel profilePanel">
-              <div className="panelHeading">
-                <div><p className="eyebrow">STEP 1</p><h2>Your career profile</h2></div>
-                <span className="saved">{profileReady ? "Ready to rank" : "Set preferences"}</span>
-              </div>
-
-              <div className="profileIdentity">
-                <div>
-                  <strong>{profile.profileName || "My job search"}</strong>
-                  <span>{email ? `Private profile for ${email}` : "Gmail account"}</span>
-                </div>
-                <button type="button" className="resetLink" onClick={resetProfile}>Start over</button>
-              </div>
-
-              {!profileReady && (
-                <div className="profileIdentity">
-                  <div>
-                    <strong>Make the matching yours</strong>
-                    <span>Add at least one target role, skill, location, industry, or seniority preference. Until then, detected job alerts are shown unranked.</span>
-                  </div>
-                </div>
-              )}
-
-              <label>
-                Profile name
-                <span>Optional label</span>
-                <input value={profile.profileName} onChange={(event) => update("profileName", event.target.value)} placeholder="My job search" />
-              </label>
-
-              <label>
-                Target roles
-                <span>One per line or comma-separated</span>
-                <textarea value={profile.targetRoles} onChange={(event) => update("targetRoles", event.target.value)} placeholder={"Product Manager\nRegistered Nurse\nSoftware Engineer"} />
-              </label>
-
-              <label>
-                Skills
-                <span>Any professional or domain skills</span>
-                <textarea value={profile.skills} onChange={(event) => update("skills", event.target.value)} placeholder="project management, Excel, React, patient care" />
-              </label>
-
-              <label>
-                Preferred locations
-                <span>Cities, states, countries, or regions</span>
-                <textarea value={profile.preferredLocations} onChange={(event) => update("preferredLocations", event.target.value)} placeholder={"Chicago, IL\nLondon\nBay Area"} />
-              </label>
-
-              <label>
-                Preferred seniority
-                <span>Levels or title keywords</span>
-                <input value={profile.seniorityKeywords} onChange={(event) => update("seniorityKeywords", event.target.value)} placeholder="entry level, mid-level, senior, manager" />
-              </label>
-
-              <label>
-                Industry keywords
-                <span>Fields you want to prioritize</span>
-                <input value={profile.industryKeywords} onChange={(event) => update("industryKeywords", event.target.value)} placeholder="healthcare, finance, technology, education" />
-              </label>
-
-              <label>
-                Deal-breaker keywords
-                <span>Lower the score when found</span>
-                <input value={profile.avoidKeywords} onChange={(event) => update("avoidKeywords", event.target.value)} placeholder="contract, travel required, nights, relocation required" />
-              </label>
-
-              <div className="toggleRow">
-                <div><strong>Prefer remote roles</strong><span>Give remote jobs a location-match bonus</span></div>
-                <button type="button" className={`toggle ${profile.remoteOkay ? "on" : ""}`} aria-pressed={profile.remoteOkay} onClick={() => update("remoteOkay", !profile.remoteOkay)}><span /></button>
-              </div>
-
-              <label>
-                Minimum match: <b>{profile.minimumMatch}%</b>
-                <input className="range" type="range" min="20" max="95" step="5" value={profile.minimumMatch} onChange={(event) => update("minimumMatch", Number(event.target.value))} />
-              </label>
-            </aside>
-
-            <section className="panel resultsPanel">
-              <div className="panelHeading">
-                <div><p className="eyebrow">STEP 2</p><h2>{profileReady ? "Best matches" : "Detected job alerts"}</h2></div>
-                {lastScan && <span className="saved">Updated {new Date(lastScan).toLocaleString()}</span>}
-              </div>
-
-              {error && <div className="alert">{error}</div>}
-
-              {jobs.length === 0 ? (
-                <div className="emptyState">
-                  <div className="emptyIcon">↗</div>
-                  <h3>{profileReady ? "Your profile is ready" : "Your workspace is ready"}</h3>
-                  <p>
-                    {profileReady
-                      ? "Scan the last 30 days of job-related email to rank opportunities against your preferences."
-                      : "You can scan now to see detected alerts, or add preferences first to get personalized match scores."}
-                  </p>
-                  <button className="button primary" disabled={loading} onClick={scanGmail}>{loading ? "Scanning…" : "Scan job emails"}</button>
-                </div>
-              ) : (
-                <div className="jobList">
-                  {jobs.map((job) => (
-                    <article className="jobCard" key={job.id}>
-                      <div className="scoreWrap">
-                        {profileReady ? (
-                          <div className={`score ${job.score >= 80 ? "great" : job.score >= 65 ? "good" : "fair"}`}>{job.score}<small>%</small></div>
-                        ) : (
-                          <div className="score fair">—</div>
-                        )}
-                        <span>{profileReady ? "match" : "unranked"}</span>
-                      </div>
-                      <div className="jobBody">
-                        <div className="jobTopline">
-                          <div><h3>{job.title}</h3><p>{job.company} · {job.location} · {job.source}</p></div>
-                          <a href={job.emailUrl} target="_blank" rel="noreferrer" className="openLink">Open email ↗</a>
-                        </div>
-                        <div className="reasonRow">
-                          {profileReady
-                            ? job.reasons.map((reason) => <span className={reason.startsWith("Caution:") ? "caution" : ""} key={reason}>{reason}</span>)
-                            : <span>Add profile preferences to rank this job</span>}
-                        </div>
-                        <p className="snippet">{job.snippet}</p>
-                      </div>
-                    </article>
-                  ))}
-                </div>
-              )}
-            </section>
+      <div className="workspace">
+        <aside className="panel profilePanel">
+          <div className="panelHeading">
+            <div><p className="eyebrow">STEP 1</p><h2>Your career profile</h2></div>
+            <span className="saved">{profileReady ? "Ready to match" : "Set preferences"}</span>
           </div>
-        </>
-      )}
+
+          <div className="resumeImport">
+            <div>
+              <strong>Import your resume</strong>
+              <span>PDF, DOCX, TXT or MD · we suggest roles, skills, seniority and industries</span>
+            </div>
+            <label className="uploadButton">
+              {resumeLoading ? "Reading…" : "Choose resume"}
+              <input type="file" accept=".pdf,.docx,.txt,.md,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/plain" onChange={importResume} disabled={resumeLoading} />
+            </label>
+          </div>
+          {resumeStatus && <div className="successNote">{resumeStatus}</div>}
+
+          <div className="profileIdentity">
+            <div>
+              <strong>{profile.profileName || "My job search"}</strong>
+              <span>{connected && email ? `Saved for ${email}` : "Saved on this device"}</span>
+            </div>
+            <button type="button" className="resetLink" onClick={resetProfile}>Start over</button>
+          </div>
+
+          <label>
+            Profile name
+            <span>Optional label</span>
+            <input value={profile.profileName} onChange={(event) => update("profileName", event.target.value)} placeholder="My job search" />
+          </label>
+
+          <label>
+            Target roles
+            <span>One per line or comma-separated</span>
+            <textarea value={profile.targetRoles} onChange={(event) => update("targetRoles", event.target.value)} placeholder={"Product Manager\nRegistered Nurse\nSoftware Engineer"} />
+          </label>
+
+          <label>
+            Skills
+            <span>Professional and domain skills</span>
+            <textarea value={profile.skills} onChange={(event) => update("skills", event.target.value)} placeholder="project management, Excel, React, patient care" />
+          </label>
+
+          <label>
+            Preferred locations
+            <span>Where you want to work</span>
+            <textarea value={profile.preferredLocations} onChange={(event) => update("preferredLocations", event.target.value)} placeholder={"Chicago, IL\nLondon\nBay Area"} />
+          </label>
+
+          <label>
+            Preferred seniority
+            <span>Levels or title keywords</span>
+            <input value={profile.seniorityKeywords} onChange={(event) => update("seniorityKeywords", event.target.value)} placeholder="entry level, senior, manager, director" />
+          </label>
+
+          <label>
+            Industry keywords
+            <span>Fields to prioritize</span>
+            <input value={profile.industryKeywords} onChange={(event) => update("industryKeywords", event.target.value)} placeholder="healthcare, finance, technology, education" />
+          </label>
+
+          <label>
+            Deal-breaker keywords
+            <span>Lower the score when found</span>
+            <input value={profile.avoidKeywords} onChange={(event) => update("avoidKeywords", event.target.value)} placeholder="contract, nights, heavy travel, relocation required" />
+          </label>
+
+          <div className="toggleRow">
+            <div><strong>Prefer remote roles</strong><span>Give remote jobs a location-match bonus</span></div>
+            <button type="button" className={`toggle ${profile.remoteOkay ? "on" : ""}`} aria-pressed={profile.remoteOkay} onClick={() => update("remoteOkay", !profile.remoteOkay)}><span /></button>
+          </div>
+
+          <label>
+            Minimum match: <b>{profile.minimumMatch}%</b>
+            <input className="range" type="range" min="20" max="95" step="5" value={profile.minimumMatch} onChange={(event) => update("minimumMatch", Number(event.target.value))} />
+          </label>
+        </aside>
+
+        <section className="panel resultsPanel">
+          <div className="panelHeading">
+            <div><p className="eyebrow">STEP 2</p><h2>Recommended jobs</h2></div>
+            {lastScan && <span className="saved">Updated {new Date(lastScan).toLocaleString()}</span>}
+          </div>
+
+          {error && <div className="alert">{error}</div>}
+
+          <div className="jobBoards">
+            <div className="jobBoardsCopy">
+              <strong>Search more job sites</strong>
+              <span>Open the same search on major job boards using your target role and location.</span>
+            </div>
+            <div className="boardLinks">
+              {boards.map((board) => <a key={board.name} href={board.href} target="_blank" rel="noreferrer">{board.name} ↗</a>)}
+            </div>
+          </div>
+
+          {jobs.length === 0 ? (
+            <div className="emptyState">
+              <div className="emptyIcon">↗</div>
+              <h3>{profileReady ? "Ready to find matching openings" : "Start with a resume or a few preferences"}</h3>
+              <p>
+                {profileReady
+                  ? "Find recommended jobs to combine live openings with any actionable links found in your connected Gmail alerts."
+                  : "Import a resume or enter target roles and skills. You can still run a broad search, but matching improves once the profile has some detail."}
+              </p>
+              <button className="button primary" disabled={loading} onClick={findJobs}>{loading ? "Finding jobs…" : "Find recommended jobs"}</button>
+            </div>
+          ) : (
+            <div className="jobList">
+              {jobs.map((job) => (
+                <article className="jobCard" key={job.id}>
+                  <div className="scoreWrap">
+                    {profileReady ? (
+                      <div className={`score ${job.score >= 80 ? "great" : job.score >= 65 ? "good" : "fair"}`}>{job.score}<small>%</small></div>
+                    ) : (
+                      <div className="score fair">—</div>
+                    )}
+                    <span>{profileReady ? "match" : "unranked"}</span>
+                  </div>
+                  <div className="jobBody">
+                    <div className="jobTopline">
+                      <div><h3>{job.title}</h3><p>{job.company} · {job.location} · {job.source}</p></div>
+                      <div className="jobActions">
+                        {job.emailUrl && <a href={job.emailUrl} target="_blank" rel="noreferrer" className="openLink secondaryLink">Source email</a>}
+                        <a href={job.applyUrl} target="_blank" rel="noreferrer" className="applyLink">Apply ↗</a>
+                      </div>
+                    </div>
+                    <div className="reasonRow">
+                      {profileReady
+                        ? job.reasons.map((reason) => <span className={reason.startsWith("Caution:") ? "caution" : ""} key={reason}>{reason}</span>)
+                        : <span>Actionable opening — add profile preferences to rank it</span>}
+                    </div>
+                    <p className="snippet">{job.snippet}</p>
+                  </div>
+                </article>
+              ))}
+            </div>
+          )}
+        </section>
+      </div>
 
       <footer>
-        Each Gmail account has its own career profile on this device. Gmail is accessed read-only, and Google access tokens stay in the browser session.
+        Recommendations only include opportunities with an application link. Gmail is optional and read-only. Resume files are processed to suggest profile fields and are not stored by the app.
       </footer>
     </main>
   );
